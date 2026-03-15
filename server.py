@@ -475,6 +475,14 @@ async def delete_user(uid: str, admin_uid: str):
 
 
 # ─── App Setup ────────────────────────────────────────────────────────────────
+@app.get("/")
+def root():
+    return {"message": "Raksha backend running"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 app.include_router(api_router)
 app.add_middleware(
     CORSMiddleware,

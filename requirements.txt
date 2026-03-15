@@ -6,3 +6,4 @@ httpx
 requests
 firebase-admin
 gunicorn
+python-multipart

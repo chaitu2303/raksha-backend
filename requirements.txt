@@ -1,9 +1,9 @@
 fastapi
 uvicorn
+gunicorn
+firebase-admin
+requests
+python-multipart==0.0.9
 python-dotenv
 pydantic
 httpx
-requests
-firebase-admin
-gunicorn
-python-multipart

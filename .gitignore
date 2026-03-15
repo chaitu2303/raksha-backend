@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+serviceAccount.json
+sms_debug.log
+uploads/
+ngrok.log
+ngrok_err.log
+ngrok_out.txt

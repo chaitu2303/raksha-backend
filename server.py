@@ -49,7 +49,8 @@ api_router = APIRouter(prefix="/api")
 
 
 # ─── OpenAI Initialization ──────────────────────────────────────────────────
-client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+_openai_api_key = os.getenv("OPENAI_API_KEY")
+client = AsyncOpenAI(api_key=_openai_api_key) if _openai_api_key else None
 
 # ─── Pydantic Models ─────────────────────────────────────────────────────────
 class AIChatRequest(BaseModel):

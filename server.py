@@ -13,6 +13,7 @@ from typing import Optional
 from datetime import datetime, timezone
 import httpx
 import requests as sync_requests
+from openai import AsyncOpenAI
 
 # Firebase Admin SDK
 import firebase_admin
@@ -47,7 +48,15 @@ app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 api_router = APIRouter(prefix="/api")
 
 
+# ─── OpenAI Initialization ──────────────────────────────────────────────────
+client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
 # ─── Pydantic Models ─────────────────────────────────────────────────────────
+class AIChatRequest(BaseModel):
+    message: str
+    userId: Optional[str] = None
+    language: Optional[str] = 'en'
+
 class SendAlertRequest(BaseModel):
     alertId: str
     title: str
@@ -67,27 +76,40 @@ class SendAlertRequest(BaseModel):
     imageUrl: Optional[str] = None
 
 
+class TokenRegistrationRequest(BaseModel):
+    userId: str
+    token: str
+
+
 class ChatMessageRequest(BaseModel):
     receiverId: str
+    senderId: str
     senderName: str
     message: str
+    chatId: Optional[str] = None
 
 
-# ─── Helper: Fetch all FCM tokens from Firestore ─────────────────────────────
-async def get_all_fcm_tokens() -> list[str]:
-    """Reads all users from Firestore and returns their stored FCM tokens."""
+# ─── Helper: Fetch all Notification Tokens ─────────────────────────────────
+async def get_all_notification_tokens() -> dict[str, list[str]]:
+    """Reads all users and returns ONLY valid FCM tokens (not Expo tokens)."""
     loop = asyncio.get_event_loop()
     
     def _fetch():
         users_ref = db.collection('users')
         docs = users_ref.stream()
-        tokens = []
+        fcm_tokens = []
+        skipped = 0
         for doc in docs:
             data = doc.to_dict()
-            token = data.get('fcmToken')
-            if token and isinstance(token, str) and len(token) > 10:
-                tokens.append(token)
-        return tokens
+            # Prefer fcmToken; fall back to expoPushToken only if it is NOT an Expo format
+            fcm = data.get('fcmToken', '')
+            if fcm and isinstance(fcm, str) and len(fcm) > 10 and not fcm.startswith('ExponentPushToken'):
+                fcm_tokens.append(fcm)
+            else:
+                skipped += 1
+        unique = list(set(fcm_tokens))
+        logger.info(f"[FCM] Found {len(unique)} valid FCM tokens ({skipped} users had no/invalid FCM token)")
+        return {"fcm": unique, "expo": []}
     
     return await loop.run_in_executor(None, _fetch)
 
@@ -103,9 +125,11 @@ async def get_all_phone_numbers() -> list[str]:
         docs = users_ref.stream()
         phone_numbers = []
         for doc in docs:
-            p = doc.to_dict().get('phone')
+            data = doc.to_dict()
+            # Check both 'phone' and 'phoneNumber' fields
+            p = data.get('phone') or data.get('phoneNumber') or ''
             if p and isinstance(p, str):
-                # Remove non-numeric characters
+                # Remove non-numeric characters (+91, spaces, dashes)
                 clean_p = "".join(filter(str.isdigit, p))
                 if len(clean_p) >= 10:
                     # Take last 10 digits for Indian standard
@@ -113,7 +137,9 @@ async def get_all_phone_numbers() -> list[str]:
                     phone_numbers.append(final_p)
                 else:
                     logger.warning(f"[SMS] Skipping invalid number: {p}")
-        return list(set(phone_numbers)) # Unique only
+        unique = list(set(phone_numbers))
+        logger.info(f"[SMS] Found {len(unique)} valid phone numbers")
+        return unique
     
     return await loop.run_in_executor(None, _fetch)
 
@@ -151,6 +177,7 @@ async def send_fcm_broadcast(tokens: list[str], title: str, body: str, data: dic
                             channel_id='emergency-alerts',
                             sound='default',
                             default_vibrate_timings=True,
+                            notification_priority='PRIORITY_MAX'
                         ),
                     ),
                     apns=messaging.APNSConfig(
@@ -185,6 +212,51 @@ async def send_fcm_broadcast(tokens: list[str], title: str, body: str, data: dic
     return await loop.run_in_executor(None, _send)
 
 
+# ─── Helper: Send Expo Push Notifications ─────────────────────────────────────
+async def send_expo_broadcast(tokens: list[str], title: str, body: str, data: dict) -> dict:
+    """Sends push notifications via Expo's Push API."""
+    if not tokens:
+        return {"success_count": 0, "failure_count": 0}
+    
+    expo_url = "https://exp.host/--/api/v2/push/send"
+    messages = []
+    for token in tokens:
+        messages.append({
+            "to": token,
+            "title": title,
+            "body": body,
+            "data": data,
+            "sound": "default",
+            "priority": "high",
+            "channelId": "emergency-alerts"
+        })
+    
+    success_count = 0
+    failure_count = 0
+    try:
+        async with httpx.AsyncClient() as client:
+            # Chunk Expo messages (Expo recommends 100 max per request)
+            for i in range(0, len(messages), 100):
+                batch = messages[i:i+100]
+                response = await client.post(expo_url, json=batch, timeout=30.0)
+                if response.status_code == 200:
+                    res_data = response.json()
+                    for item in res_data.get("data", []):
+                        if item.get("status") == "ok":
+                            success_count += 1
+                        else:
+                            failure_count += 1
+                else:
+                    failure_count += len(batch)
+            
+            logger.info(f"[Expo] Delivered {success_count} notifications")
+    except Exception as e:
+        logger.error(f"[Expo] Error: {e}")
+        failure_count = len(tokens) - success_count
+        
+    return {"success_count": success_count, "failure_count": failure_count}
+
+
 # ─── Helper: Send SMS via Fast2SMS ────────────────────────────────────────────
 async def send_sms_broadcast(numbers: list[str], message_text: str) -> dict:
     """Sends SMS to all numbers in a single bulk request. Respects SMS_ENABLED toggle."""
@@ -192,40 +264,29 @@ async def send_sms_broadcast(numbers: list[str], message_text: str) -> dict:
     
     if not sms_enabled:
         logger.info(f"[SMS] SMS_ENABLED is false. Skipping actual send for {len(numbers)} numbers.")
-        # We still write to debug log so the user can see what WOULD have been sent
-        with open(ROOT_DIR / "sms_debug.log", "a", encoding="utf-8") as f:
-            f.write(f"\n[{datetime.now()}] [TEST-MODE] To: {','.join(numbers)}\n")
-            f.write(f"Message: {message_text}\n")
-            f.write("-" * 50 + "\n")
         return {"success": True, "count": len(numbers), "mode": "simulated"}
 
     api_key = os.getenv("FAST2SMS_API_KEY", "").strip()
     if not api_key:
-        logger.error("[SMS] FAST2SMS_API_KEY not found in .env")
         return {"success": False, "error": "API Key missing"}
 
     if not numbers:
         return {"success": True, "count": 0}
 
-    url = "https://www.fast2sms.com/dev/bulkV2"
-    
-    # TRANSACTIONAL/QUICK ROUTES (q) ARE VERY STRICT
-    # We must use plain text, NO emojis, and keep it under 160 characters
-    # Note: message_text is the professional template, but 'q' route usually rejects long texts.
-    # We will use a concise format for the 'q' route but include the deep link if possible.
-    concise_message = f"RAKSHA ALERT: Emergency! Details: raksha://alert/ID. Check app now."
-    # If the alert id is known, we should ideally swap ID
-    # But for bulk 'q' route, Fast2SMS usually requires the SAME message for all.
-    # We'll use the provided message_text if it's within limits, else fallback.
-    
-    final_message = message_text if len(message_text) <= 160 else concise_message
+    # Ensure message fits character limits for 'q' route (160 characters)
+    final_message = message_text
+    if len(final_message) > 160:
+        final_message = final_message[:157] + "..."
 
+    sms_url = "https://www.fast2sms.com/dev/bulkV2"
     payload = {
         "route": "q",
         "message": final_message,
         "language": "english",
         "numbers": ",".join(numbers)
     }
+    logger.info(f"==> [SMS DEBUG] Sending to numbers: {payload['numbers']}")
+    
     
     headers = {
         "authorization": api_key,
@@ -234,60 +295,22 @@ async def send_sms_broadcast(numbers: list[str], message_text: str) -> dict:
 
     try:
         def _call_api():
-            return sync_requests.post(url, data=payload, headers=headers, timeout=20)
+            return sync_requests.post(sms_url, data=payload, headers=headers, timeout=20)
         
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(None, _call_api)
         data = response.json()
         
-        # Log to file for verification
-        with open(ROOT_DIR / "sms_debug.log", "a", encoding="utf-8") as f:
-            f.write(f"\n[{datetime.now()}] To: {','.join(numbers)}\n")
-            f.write(f"Status: {response.status_code} | Result: {data.get('return')}\n")
-            f.write(f"JSON: {data}\n")
-            f.write("-" * 50 + "\n")
+        logger.info(f"==> [SMS DEBUG] Fast2SMS Status: {response.status_code}")
+        logger.info(f"==> [SMS DEBUG] Fast2SMS Response JSON: {data}")
         
         if response.status_code == 200 and data.get("return"):
-            logger.info(f"[SMS] Fast2SMS Bulk Success: {data.get('request_id')}")
             return {"success": True, "count": len(numbers)}
-        else:
-            msg = data.get("message", "Unknown error")
-            if isinstance(msg, list): msg = " ".join(msg)
-            logger.error(f"[SMS] Fast2SMS Bulk Rejected: {msg}")
-            return {"success": False, "error": msg}
-
+        return {"success": False, "error": data.get("message", "Fast2SMS Error")}
     except Exception as e:
         logger.error(f"[SMS] Bulk request failed: {e}")
         return {"success": False, "error": str(e)}
 
-
-# ─── Helper: Professional Template Generator ─────────────────────────────────
-def generate_professional_template(alert: SendAlertRequest) -> str:
-    """Formats an emergency alert using the official Raksha template."""
-    now = datetime.now()
-    timestamp_str = now.strftime("%d %B %Y | %I:%M %p")
-    
-    incident_label = alert.alertType.replace('_', ' ').title()
-    
-    # Coordinates link
-    map_link = f"https://maps.google.com/?q={alert.latitude},{alert.longitude}" if alert.latitude and alert.longitude else "Location data unavailable"
-
-    # Deep Link for App
-    deep_link = f"raksha://alert/{alert.alertId}"
-
-    # Template Construction
-    message = f"RAKSHA ALERT\n\n"
-    message += f"Type: {alert.alertType.replace('_', ' ').title()}\n\n"
-    message += f"Location:\nhttps://maps.google.com/?q={alert.latitude},{alert.longitude}\n\n"
-    message += f"Time:\n{alert.dateTime}\n\n"
-    message += f"Description:\n{alert.description}\n\n"
-    if alert.imageUrl:
-        message += f"📷 Photo:\n{alert.imageUrl}\n\n"
-        
-    message += f"View alert:\n{deep_link}\n\n"
-    message += f"Raksha Safety System"
-    
-    return message
 
 
 # ─── Helper: Log notification to Firestore ────────────────────────────────────
@@ -314,6 +337,78 @@ async def root():
     return {"message": "Raksha Alert API v2 – FCM Edition", "status": "running"}
 
 
+@api_router.post("/ai/chat")
+async def ai_chat(req: AIChatRequest):
+    """
+    Intelligent AI Assistant for Raksha Alert.
+    Provides safety guidance, reporting help, and app navigation.
+    """
+    if not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(status_code=500, detail="AI Service configuration missing.")
+
+    system_prompt = (
+        "You are the Raksha Alert AI Assistant, an intelligent safety companion for the 'Raksha Alert' emergency system.\n\n"
+        "BEHAVIOR RULES:\n"
+        "- Be clear, short, and helpful.\n"
+        "- Use simple language.\n"
+        "- Always prioritize user safety.\n"
+        "- If the user says they are in danger/emergency (e.g., 'help me', 'danger'), IMMEDIATELY respond: "
+        "'Please press the SOS button immediately or contact local emergency services.'\n"
+        "- For reporting: Go to Report -> Fill details -> Submit.\n"
+        "- For sightings: Go to Report Sighting -> Enter details -> Submit.\n"
+        "- Never give harmful advice.\n\n"
+        "APP FEATURES:\n"
+        "- Report Incident, Report Sighting, Real-time Alerts, Chat with Admin, SOS Button, Map View, Admin Dashboard.\n\n"
+        f"The user's preferred language is {req.language}. Please respond in that language."
+    )
+
+    try:
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": req.message},
+            ],
+            temperature=0.7,
+            max_tokens=500
+        )
+        reply = response.choices[0].message.content
+        return {"reply": reply}
+    except Exception as e:
+        logger.error(f"[AI] Chat Error: {e}")
+        raise HTTPException(status_code=500, detail="AI Assistant is currently unavailable.")
+
+
+@api_router.post("/ai/transcribe")
+async def ai_transcribe(file: UploadFile = File(...)):
+    """
+    Transcribe audio using OpenAI Whisper.
+    """
+    if not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(status_code=500, detail="AI Service configuration missing.")
+
+    try:
+        # Save temporary file
+        temp_path = f"uploads/temp_{uuid.uuid4()}.m4a"
+        with open(temp_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        # Transcribe
+        with open(temp_path, "rb") as audio_file:
+            transcript = await client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file
+            )
+        
+        # Cleanup
+        os.remove(temp_path)
+        
+        return {"text": transcript.text}
+    except Exception as e:
+        logger.error(f"[AI] Transcription Error: {e}")
+        raise HTTPException(status_code=500, detail="Voice transcription failed.")
+
+
 @api_router.get("/health")
 async def health():
     return {"status": "Raksha backend running"}
@@ -327,54 +422,63 @@ async def send_alert_notifications(alert: SendAlertRequest):
     """
     logger.info(f"[Notify] Broadcast triggered for alert: {alert.alertId} | Type: {alert.alertType}")
     
-    # 1. Fetch ALL FCM tokens (no radius/location filter)
-    tokens = await get_all_fcm_tokens()
-    total_tokens = len(tokens)
-    logger.info(f"[Notify] Found {total_tokens} FCM tokens to broadcast to")
+    # 1. Fetch ALL tokens (Segregated)
+    tokens_seg = await get_all_notification_tokens()
+    fcm_tokens = tokens_seg["fcm"]
+    expo_tokens = tokens_seg["expo"]
     
-    if total_tokens == 0:
-        logger.warning("[Notify] No FCM tokens found. Users may not have registered their device yet.")
-        return {
-            "success": True,
-            "message": "No registered device tokens found. Ensure users have opened the app at least once.",
-            "targetedCount": 0,
-            "results": {"success_count": 0, "failure_count": 0, "errors": []},
-        }
+    logger.info(f"[Notify] tokens: FCM({len(fcm_tokens)}) | Expo({len(expo_tokens)})")
     
     # 2. Build notification payload
     alert_type_label = alert.alertType.replace('_', ' ').title()
-    
-    # Professional Template for SMS
-    structured_sms_text = generate_professional_template(alert)
-    
-    # Concise Template for Push (Standard Notification Tray behavior)
     push_title = f"🚨 {alert_type_label}: {alert.title}"
-    push_body = f"{alert.description[:60]}... Tap to view map & photo."
+    push_body = f"{alert.description[:100]}... Tap to view."
     
     data_payload = {
         "alertId": alert.alertId,
+        "alert_id": alert.alertId, # Backward compatibility & frontend preference
         "alertType": alert.alertType,
         "location": alert.location,
-        "screen": "alert_detail",  # used by app to navigate
+        "screen": "alert_detail",
     }
     
-    # 3. Send FCM multicast
-    result = await send_fcm_broadcast(tokens, push_title, push_body, data_payload)
-    logger.info(f"[Notify] FCM result: ✅ {result['success_count']} sent, ❌ {result['failure_count']} failed")
+    # 3. Send FCM broadcast (FCM ONLY — Expo Push removed per user request)
+    fcm_result = {}
+    if fcm_tokens:
+        fcm_result = await send_fcm_broadcast(fcm_tokens, push_title, push_body, data_payload)
+    else:
+        logger.warning("[Notify] No FCM tokens found. No push notifications sent.")
     
-    # 3b. Send SMS Fallback
+    # 4. Send Quick SMS (Fast2SMS 'q' route)
     sms_numbers = await get_all_phone_numbers()
-    sms_result = await send_sms_broadcast(sms_numbers, structured_sms_text)
+    sms_text = "RAKSHA ALERT: Emergency reported nearby. Please check the Raksha app for details."
+    sms_result = await send_sms_broadcast(sms_numbers, sms_text)
     
-    # 4. Log to Firestore
-    await log_notification(alert.alertId, push_title, structured_sms_text, total_tokens, result)
+    total_success = fcm_result.get("success_count", 0)
+    total_failure = fcm_result.get("failure_count", 0)
+    
+    combined_result = {
+        "success_count": total_success,
+        "failure_count": total_failure,
+        "fcm": fcm_result,
+    }
+    
+    # 5. Log to Firestore
+    await log_notification(alert.alertId, push_title, push_body, len(fcm_tokens), combined_result)
+    
+    logger.info(f"[Notify] Broadcast done. FCM={total_success}/{len(fcm_tokens)} sent. SMS={sms_result.get('count', 0)} sent.")
     
     return {
         "success": True,
-        "targetedCount": total_tokens,
-        "results": result,
+        "targetedCount": len(fcm_tokens),
+        "results": {"fcm": fcm_result},
         "sms": sms_result,
-        "message": f"Broadcast sent to {result['success_count']}/{total_tokens} devices via FCM and SMS fallback triggered for {len(sms_numbers)} users."
+        "diagnostics": {
+            "alertId": alert.alertId,
+            "fcm_success": total_success,
+            "sms_success": sms_result.get("success", False)
+        },
+        "message": "FCM + SMS notifications broadcasted successfully."
     }
 
 
@@ -386,7 +490,8 @@ async def send_chat_notification(data: ChatMessageRequest):
     def _get_token():
         docs = db.collection('users').where('uid', '==', data.receiverId).limit(1).stream()
         for doc in docs:
-            return doc.to_dict().get('fcmToken')
+            d = doc.to_dict()
+            return d.get('fcmToken') or d.get('expoPushToken')
         return None
     
     token = await loop.run_in_executor(None, _get_token)
@@ -399,10 +504,37 @@ async def send_chat_notification(data: ChatMessageRequest):
             [token],
             title=f"💬 New message from {data.senderName}",
             body=data.message[:200],
-            data={"screen": "chat", "senderId": data.receiverId}
+            data={
+                "screen": "chat", 
+                "chatId": data.chatId or "",
+                "senderId": data.senderId
+            }
         )
         return {"success": True, "delivery": {"push": result["success_count"] > 0}}
+
     except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@api_router.post("/register-token")
+async def register_token(data: TokenRegistrationRequest):
+    """Saves or updates an FCM token for a specific user in Firestore."""
+    loop = asyncio.get_event_loop()
+    
+    def _save():
+        user_ref = db.collection('users').document(data.userId)
+        user_ref.set({
+            'fcmToken': data.token,
+            'lastTokenUpdate': datetime.now(timezone.utc).isoformat()
+        }, merge=True)
+        logger.info(f"[FCM] Registered token for user {data.userId}")
+        return True
+        
+    try:
+        await loop.run_in_executor(None, _save)
+        return {"success": True, "message": "Token registered successfully"}
+    except Exception as e:
+        logger.error(f"[FCM] Token registration failed for {data.userId}: {e}")
         return {"success": False, "error": str(e)}
 
 
@@ -412,18 +544,89 @@ async def get_stats():
     loop = asyncio.get_event_loop()
     
     def _fetch():
-        users = db.collection('users').stream()
-        alerts = db.collection('alerts').stream()
-        
-        user_list = list(users)
-        alert_list = list(alerts)
-        sos_count = sum(1 for a in alert_list if a.to_dict().get('alertType') == 'SOS_EMERGENCY')
+        # Using list() on stream() is simple for small to medium sets
+        users_count = len(list(db.collection('users').stream()))
+        alerts_count = len(list(db.collection('alerts').stream()))
+        sos_count = len(list(db.collection('sos_alerts').stream()))
+        sighting_count = len(list(db.collection('sighting_reports').stream()))
+        incident_count = len(list(db.collection('incident_reports').stream()))
         
         return {
-            "totalUsers": len(user_list),
-            "totalAlerts": len(alert_list),
+            "totalUsers": users_count,
+            "totalAlerts": alerts_count,
             "sosAlerts": sos_count,
+            "sightingReports": sighting_count,
+            "incidentReports": incident_count,
         }
+    
+    return await loop.run_in_executor(None, _fetch)
+
+
+@api_router.get("/alerts")
+async def get_alerts():
+    """Get recent alerts from Firestore."""
+    loop = asyncio.get_event_loop()
+    
+    def _fetch():
+        # Fetch last 50 alerts ordered by creation time
+        alerts_ref = db.collection('alerts').order_by('createdAt', direction=firestore.Query.DESCENDING).limit(50)
+        docs = alerts_ref.stream()
+        result = []
+        for doc in docs:
+            data = doc.to_dict()
+            data['id'] = doc.id
+            # Convert timestamp to string for JSON serialization
+            if 'createdAt' in data and data['createdAt']:
+                try:
+                    if hasattr(data['createdAt'], 'isoformat'):
+                        data['createdAt'] = data['createdAt'].isoformat()
+                    else:
+                        data['createdAt'] = str(data['createdAt'])
+                except: 
+                    data['createdAt'] = str(data['createdAt'])
+            result.append(data)
+        return result
+    
+    return await loop.run_in_executor(None, _fetch)
+
+
+@api_router.get("/users/locations")
+async def get_user_locations():
+    """Get all user locations and their current status for map markers."""
+    loop = asyncio.get_event_loop()
+    
+    def _fetch():
+        users_ref = db.collection('users')
+        users_docs = users_ref.stream()
+        
+        # Get active alerts to determine SOS status
+        active_alerts = db.collection('alerts').where('status', '!=', 'resolved').stream()
+        active_alert_creators = {a.to_dict().get('createdBy') for a in active_alerts if a.to_dict().get('alertType') == 'SOS_EMERGENCY'}
+        
+        # Get incident reports to determine Incident status
+        active_incidents = db.collection('incident_reports').where('status', 'not-in', ['resolved', 'rejected']).stream()
+        incident_creators = {i.to_dict().get('uid') or i.to_dict().get('userId') for i in active_incidents}
+        
+        results = []
+        for doc in users_docs:
+            data = doc.to_dict()
+            if 'latitude' in data and 'longitude' in data:
+                uid = doc.id
+                status = 'normal'
+                if uid in active_alert_creators:
+                    status = 'sos'
+                elif uid in incident_creators:
+                    status = 'incident'
+                
+                results.append({
+                    "id": uid,
+                    "name": data.get('name', 'Unknown'),
+                    "latitude": data.get('latitude'),
+                    "longitude": data.get('longitude'),
+                    "status": status,
+                    "lastActive": data.get('lastActive').isoformat() if data.get('lastActive') and hasattr(data.get('lastActive'), 'isoformat') else None
+                })
+        return results
     
     return await loop.run_in_executor(None, _fetch)
 

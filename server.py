@@ -197,8 +197,7 @@ async def send_fcm_broadcast(tokens: list[str], title: str, body: str, data: dic
                         notification=messaging.AndroidNotification(
                             channel_id='emergency-alerts',
                             sound='default',
-                            default_vibrate_timings=True,
-                            notification_priority='PRIORITY_MAX'
+                            default_vibrate_timings=True
                         ),
                     ),
                     apns=messaging.APNSConfig(

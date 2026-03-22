@@ -25,17 +25,37 @@ load_dotenv(ROOT_DIR / '.env')
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+FIREBASE_INIT_METHOD = "Not Initialized"
+
+import json
+
 # ─── Firebase Admin Initialization ───────────────────────────────────────────
 SERVICE_ACCOUNT_PATH = ROOT_DIR / 'serviceAccount.json'
 if not firebase_admin._apps:
-    if SERVICE_ACCOUNT_PATH.exists():
+    firebase_json_str = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+    if firebase_json_str:
+        try:
+            cred_dict = json.loads(firebase_json_str)
+            cred = credentials.Certificate(cred_dict)
+            firebase_admin.initialize_app(cred)
+            FIREBASE_INIT_METHOD = "Environment Variable (FIREBASE_SERVICE_ACCOUNT_JSON)"
+            logger.info(f"✅ Firebase Admin initialized from {FIREBASE_INIT_METHOD}")
+        except Exception as e:
+            FIREBASE_INIT_METHOD = f"Error: Failed to parse Env Var - {str(e)}"
+            logger.error(f"❌ {FIREBASE_INIT_METHOD}")
+            firebase_admin.initialize_app()
+    elif SERVICE_ACCOUNT_PATH.exists():
         cred = credentials.Certificate(str(SERVICE_ACCOUNT_PATH))
         firebase_admin.initialize_app(cred)
-        logger.info("✅ Firebase Admin SDK initialized from serviceAccount.json")
+        FIREBASE_INIT_METHOD = "Service Account File (serviceAccount.json)"
+        logger.info(f"✅ Firebase Admin SDK initialized from {FIREBASE_INIT_METHOD}")
     else:
         # Fallback: use env var GOOGLE_APPLICATION_CREDENTIALS
         firebase_admin.initialize_app()
-        logger.info("✅ Firebase Admin SDK initialized from environment credentials")
+        FIREBASE_INIT_METHOD = "Default Credentials / Environment Fallback"
+        logger.info(f"✅ Firebase Admin SDK initialized from {FIREBASE_INIT_METHOD}")
+else:
+    FIREBASE_INIT_METHOD = "Already Initialized"
 
 db = firestore.client()
 
@@ -315,7 +335,7 @@ async def send_sms_broadcast(numbers: list[str], message_text: str) -> dict:
 
 
 # ─── Helper: Log notification to Firestore ────────────────────────────────────
-async def log_notification(alert_id: str, title: str, body: str, user_count: int, result: dict):
+async def log_notification(alert_id: str, title: str, body: str, user_count: int, result: dict, error_msg: Optional[str] = None):
     loop = asyncio.get_event_loop()
     
     def _log():
@@ -326,6 +346,7 @@ async def log_notification(alert_id: str, title: str, body: str, user_count: int
             'sentUsersCount': user_count,
             'successCount': result.get('success_count', 0),
             'failureCount': result.get('failure_count', 0),
+            'errorMessage': error_msg or (result.get('errors', [""])[0] if result.get('errors') else None),
             'timestamp': firestore.SERVER_TIMESTAMP,
         })
     
@@ -415,6 +436,25 @@ async def health():
     return {"status": "Raksha backend running"}
 
 
+@api_router.get("/debug/firebase-status")
+async def get_firebase_status():
+    """Diagnostic endpoint to check Firebase initialization state."""
+    try:
+        app = firebase_admin.get_app()
+        return {
+            "initialized": True,
+            "method": FIREBASE_INIT_METHOD,
+            "project_id": app.project_id,
+            "name": app.name
+        }
+    except Exception as e:
+        return {
+            "initialized": False,
+            "method": FIREBASE_INIT_METHOD,
+            "error": str(e)
+        }
+
+
 @api_router.post("/notifications/send-alert")
 async def send_alert_notifications(alert: SendAlertRequest):
     """
@@ -462,10 +502,18 @@ async def send_alert_notifications(alert: SendAlertRequest):
         "success_count": total_success,
         "failure_count": total_failure,
         "fcm": fcm_result,
+        "sms": sms_result
     }
     
+    # Collect primary error for the log
+    primary_error = None
+    if fcm_result.get('errors'):
+        primary_error = fcm_result['errors'][0]
+    elif sms_result.get('error'):
+        primary_error = sms_result['error']
+
     # 5. Log to Firestore
-    await log_notification(alert.alertId, push_title, push_body, len(fcm_tokens), combined_result)
+    await log_notification(alert.alertId, push_title, push_body, len(fcm_tokens), combined_result, error_msg=primary_error)
     
     logger.info(f"[Notify] Broadcast done. FCM={total_success}/{len(fcm_tokens)} sent. SMS={sms_result.get('count', 0)} sent.")
     

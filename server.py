@@ -726,10 +726,12 @@ async def delete_user(uid: str, admin_uid: str):
 
 
 # ─── App Setup ────────────────────────────────────────────────────────────────
+@app.head("/")
 @app.get("/")
 def root():
     return {"message": "Raksha backend running"}
 
+@app.head("/health")
 @app.get("/health")
 def health():
     return {"status": "ok"}
